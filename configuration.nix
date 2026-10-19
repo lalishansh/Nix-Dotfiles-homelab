@@ -56,11 +56,9 @@ let machine_name = "homelab"; in
           udisks
         ];
         plugins = { inherit (pkgs.yaziPlugins) mount mediainfo; };
-        settings.keymap = {
-          mgr.prepend_keymap = [
-            {on = "M"; run = "plugin mount"; desc = "Mount Manager"; }
-          ];
-        };
+        settings.keymap.mgr.prepend_keymap = [
+          {on = "M"; run = "plugin mount"; desc = "Mount Manager"; }
+        ];
         settings.yazi = {
           mgr.show_hidden = true;
           tasks.image_alloc = 1024*1024*1024;
@@ -77,6 +75,16 @@ let machine_name = "homelab"; in
         };
       })
     ];
+  };
+
+  services.create_ap = {
+    enable = true;
+    settings = {
+      INTERNET_IFACE = "enu1u3";
+      WIFI_IFACE = "wlP2p1s0";
+      SSID = machine_name;
+      PASSPHRASE = "12345678";
+    };
   };
 
   # This value determines the NixOS release from which the default
