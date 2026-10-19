@@ -84,6 +84,10 @@ let machine_name = "homelab"; in
       WIFI_IFACE = "wlP2p1s0";
       SSID = machine_name;
       PASSPHRASE = "12345678";
+      IEEE80211N = 1;
+      IEEE80211AC = 1;
+      IEEE80211AX = 1;
+      FREQ_BAND = 5;
     };
   };
 
