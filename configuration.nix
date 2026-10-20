@@ -1,6 +1,11 @@
 { lib, pkgs, ... }:
-let machine_name = "homelab"; in
-{
+let
+  machine_name = "homelab";
+  host_addr = "192.168.1.12";
+  wpa_interface = "wlP2p1s0";
+  wpa_password = "12345678";
+  tailscale_authKeyFile = "/etc/tailscale_psk";
+in {
   imports = [
     # Include the results of the hardware scan.
     ./hardware-configuration.nix
@@ -50,6 +55,11 @@ let machine_name = "homelab"; in
     packages = with pkgs; [
       git
 
+      # here (server) $ iroh-ssh server --persist
+      # pc (client) $ iroh-ssh homelab@xxxxxxxxxxxblahblahblahzzzzzzz
+      # limitation - no sshfs
+      iroh-ssh
+
       (yazi.override {
         extraPackages = with pkgs; [
           mediainfo
@@ -81,14 +91,26 @@ let machine_name = "homelab"; in
     enable = true;
     settings = {
       INTERNET_IFACE = "enu1u3";
-      WIFI_IFACE = "wlP2p1s0";
+      WIFI_IFACE = wpa_interface;
+      PASSPHRASE = wpa_password;
       SSID = machine_name;
-      PASSPHRASE = "12345678";
+      GATEWAY = host_addr;
       IEEE80211N = 1;
       IEEE80211AC = 1;
       IEEE80211AX = 1;
       FREQ_BAND = 5;
     };
+  };
+
+  services.tailscale = {
+    enable = true;
+    useRoutingFeatures = "server";
+    openFirewall = true;
+    authKeyFile = "${tailscale_authKeyFile}";
+    extraUpFlags = [
+      "--reset"
+      "--ssh=true" # TODO: Disable SSH via Tailscale
+    ];
   };
 
   # This value determines the NixOS release from which the default
