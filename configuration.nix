@@ -1,15 +1,15 @@
-{ lib, pkgs, ... }:
-let
-  machine_name = "homelab";
-  host_addr = "192.168.1.12";
-  wpa_interface = "wlP2p1s0";
-  wpa_password = "12345678";
-  tailscale_authKeyFile = "/etc/tailscale_psk";
-in {
+{ config, lib, pkgs, ... }:
+{
+
   imports = [
     # Include the results of the hardware scan.
     ./hardware-configuration.nix
+    ./system
   ];
+
+  machine_name = "homelab";
+  system_mode = "wap"; # "eth" "wap" "wifi"
+  host_addr = "192.168.1.12";
 
   # Bootloader
   boot.loader = {
@@ -20,11 +20,6 @@ in {
 
   time.timeZone = "Asia/Kolkata";
   i18n.defaultLocale = "en_IN";
-
-  networking = {
-    hostName = machine_name;
-    networkmanager.enable = lib.mkDefault true;
-  };
 
   # htop, Changing some settings for being Router specific
   programs.htop = {
@@ -37,76 +32,11 @@ in {
     };
   };
 
-  # need for ssh access, quality of life
-  services.openssh = {
-    enable = true;
-    ports = [ 22 ];
-    settings = {
-      PasswordAuthentication = true;
-      UseDns = true;
-    };
-  };
-
-  services.getty.autologinUser = machine_name;
-  users.users.${machine_name} = {
-    isNormalUser = true;
-    description = "My Portable Home Server";
-    extraGroups = [ "networkmanager" "wheel" ];
-    packages = with pkgs; [
-      git
-
-      # here (server) $ iroh-ssh server --persist
-      # pc (client) $ iroh-ssh homelab@xxxxxxxxxxxblahblahblahzzzzzzz
-      # limitation - no sshfs
-      iroh-ssh
-
-      (yazi.override {
-        extraPackages = with pkgs; [
-          mediainfo
-          udisks
-        ];
-        plugins = { inherit (pkgs.yaziPlugins) mount mediainfo; };
-        settings.keymap.mgr.prepend_keymap = [
-          {on = "M"; run = "plugin mount"; desc = "Mount Manager"; }
-        ];
-        settings.yazi = {
-          mgr.show_hidden = true;
-          tasks.image_alloc = 1024*1024*1024;
-          plugin.prepend_preloaders = [
-            {mime = "{audio,video,image}/*";  run = "mediainfo";}
-            {mime = "application/subrip";     run = "mediainfo";}
-            {mime = "application/postscript"; run = "mediainfo";}
-          ];
-          plugin.prepend_previewers = [
-            {mime = "{audio,video,image}/*";  run = "mediainfo";}
-            {mime = "application/subrip";     run = "mediainfo";}
-            {mime = "application/postscript"; run = "mediainfo";}
-          ];
-        };
-      })
-    ];
-  };
-
-  services.create_ap = {
-    enable = true;
-    settings = {
-      INTERNET_IFACE = "enu1u3";
-      WIFI_IFACE = wpa_interface;
-      PASSPHRASE = wpa_password;
-      SSID = machine_name;
-      GATEWAY = host_addr;
-      IEEE80211N = 1;
-      IEEE80211AC = 1;
-      IEEE80211AX = 1;
-      FREQ_BAND = 5;
-    };
-  };
-
   services.tailscale = {
     enable = true;
     useRoutingFeatures = "server";
     openFirewall = true;
-    authKeyFile = "${tailscale_authKeyFile}";
+    authKeyFile = "/etc/tailscale_psk";
     extraUpFlags = [
       "--reset"
       "--ssh=true" # TODO: Disable SSH via Tailscale
