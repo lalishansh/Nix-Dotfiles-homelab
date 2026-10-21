@@ -5,8 +5,8 @@ let
 in {
   imports = let for = name: extra: mkIf (mode == name) (import ./${name}.nix ({ inherit config lib pkgs; } // extra)); in [
     ./options.nix
-    (for "wap" {eth_interface = "enu1u2";})
-    (for "wifi")
+    (for "wap" {eth_interface = "enu1u2"; name = "BloodPoint"; password = "12345678";})
+    (for "wifi" {name = "moto g(60)_3483"; password = "1q2w3e4r";})
     (for "eth")
   ];
 

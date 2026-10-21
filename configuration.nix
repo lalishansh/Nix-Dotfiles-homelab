@@ -8,7 +8,7 @@
   ];
 
   machine_name = "homelab";
-  system_mode = "wap"; # "eth" "wap" "wifi"
+  system_mode = "wifi"; # "eth" "wap" "wifi"
   host_addr = "192.168.1.12";
 
   # Bootloader

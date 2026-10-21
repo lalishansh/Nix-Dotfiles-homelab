@@ -1,19 +1,20 @@
 { config, lib, pkgs,
-  eth_interface ? "enu1u2",
-  wpa_interface ? "wlP2p1s0",
-  wpa_password ? "12345678",
+  ethernet ? "enu1u2",
+  interface ? "wlP2p1s0",
+  name ? config.machine_name,
+  password ? "12345678",
   ... }:
 {
-  networking.networkmanager.unmanaged = [ wpa_interface ];
+  networking.networkmanager.unmanaged = [ interface ];
   services.create_ap = {
     enable = true;
     settings = {
-      INTERNET_IFACE = eth_interface;
-      WIFI_IFACE = wpa_interface;
-      PASSPHRASE = wpa_password;
-      SSID = config.machine_name;
+      INTERNET_IFACE = ethernet;
+      WIFI_IFACE = interface;
+      PASSPHRASE = password;
+      SSID = name;
       GATEWAY = config.host_addr;
-      FREQ_BAND = 5;
+      # FREQ_BAND = 5; # not working for me right now
     };
   };
 }
