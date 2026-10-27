@@ -8,8 +8,7 @@
   ];
 
   machine_name = "homelab";
-  system_mode = "wifi"; # "eth" "wap" "wifi"
-  host_addr = "192.168.1.12";
+  system_mode = "wifi"; # legacy; wireless mode is runtime via dashboard state.json
 
   # Bootloader
   boot.loader = {
