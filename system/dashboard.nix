@@ -6,6 +6,7 @@ let
   dashboard = pkgs.writeShellScriptBin "wireless-dashboard" ''
     if [ -f ${liveScript} ]; then
       exec ${lib.getExe pkgs.python3} ${liveScript} "$@"
+      exit 0
     fi
     exec ${lib.getExe pkgs.python3} ${./dashboard.py} "$@"
   '';
@@ -49,11 +50,13 @@ in
       coreutils
       python3
     ];
+    environment = {
+      # Must match Caddy handle_path /wireless* on dashboard.lan (same-origin iframe).
+      WIRELESS_DASHBOARD_BASE = "/wireless";
+    };
     serviceConfig = {
       Type = "simple";
-      # BASE path must match Tailscale/Glance iframe path (/wireless).
-      Environment = [ "WIRELESS_DASHBOARD_BASE=/wireless" ];
-      ExecStart = "${lib.getExe dashboard} -c ${statePath} --serve 8080";
+      ExecStart = "${lib.getExe dashboard} -c ${statePath} -h ${config.host_addr} --serve 8080";
       Restart = "on-failure";
       RestartSec = 3;
     };

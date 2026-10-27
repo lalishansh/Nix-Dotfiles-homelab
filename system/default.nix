@@ -3,6 +3,7 @@
   imports = [
     ./options.nix
     ./dashboard.nix
+    ./lan-services.nix
   ];
 
   networking.networkmanager.enable = false;
@@ -26,9 +27,8 @@
                 {
                   type = "iframe";
                   title = "Wireless";
-                  # Via Tailscale HTTPS path proxy (see glance-serve). Local-only:
-                  # source = "http://127.0.0.1:8080";
-                  source = "/wireless";
+                  # Same origin as Glance (dashboard.lan) so iframe can sync theme vars
+                  source = "http://dashboard.${config.host_domain}/wireless";
                   height = 720;
                 }
               ];
@@ -38,27 +38,6 @@
       ];
     };
     openFirewall = true;
-  };
-
-  systemd.services.glance-serve = {
-    description = "Tailscale serve Glance + wireless dashboard";
-    after = [ "tailscaled.service" "wireless-dashboard.service" ];
-    wants = [ "tailscaled.service" "wireless-dashboard.service" ];
-    wantedBy = [ "multi-user.target" ];
-    path = with pkgs; [ tailscale ];
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-      ExecStart = pkgs.writeShellScript "glance-serve-start" ''
-        ${lib.getExe pkgs.tailscale} serve --bg ${toString 5678}
-        ${lib.getExe pkgs.tailscale} serve --bg --set-path=/wireless http://127.0.0.1:8080
-      '';
-      ExecStop = pkgs.writeShellScript "glance-serve-stop" ''
-        ${lib.getExe pkgs.tailscale} serve reset || true
-      '';
-      Restart = "on-failure";
-      RestartSec = 3;
-    };
   };
 
   # COMMON SETTINGS

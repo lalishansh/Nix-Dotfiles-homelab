@@ -36,6 +36,7 @@ from urllib.parse import parse_qs, urlparse
 # =============================================================================
 
 DEFAULT_HOST_ADDR = "192.168.12.1"
+_host_addr: str = DEFAULT_HOST_ADDR
 DEFAULT_COUNTRY = "IN"
 DEFAULT_CHANNEL = 149
 DEFAULT_WAP_SSID = "BloodPoint"
@@ -69,7 +70,10 @@ def connection_summary() -> str:
     parts: list[str] = []
     for iface, info in sorted(_runtime.items()):
         if info.get("ok"):
-            if info.get("mode") == "wifi":
+            mode = info.get("mode")
+            if mode == "off":
+                parts.append(f"{iface}: off")
+            elif mode == "wifi":
                 parts.append(f"{iface}: wifi → {info.get('ssid')}")
             else:
                 up = info.get("uplink") or "?"
@@ -98,6 +102,14 @@ def _which(name: str) -> str | None:
 
 def _run(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=check, text=True, capture_output=True)
+
+
+def get_host_addr() -> str:
+    return _host_addr
+
+
+def default_off_dict() -> dict[str, Any]:
+    return {"mode": "off"}
 
 
 def default_wap_dict(ssid: str | None = None) -> dict[str, Any]:
@@ -137,10 +149,28 @@ class Profile(ABC):
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "Profile":
-        mode = data.get("mode", "wap")
+        mode = data.get("mode", "off")
+        if mode == "off":
+            return OffProfile.from_dict(data)
         if mode == "wifi":
             return WiFiProfile.from_dict(data)
         return WAPProfile.from_dict(data)
+
+
+class OffProfile(Profile):
+    """Bring the interface down; default profile at index 0."""
+
+    mode = "off"
+
+    def __init__(self) -> None:
+        super().__init__(ssid="", password="")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"mode": "off"}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None = None) -> "OffProfile":
+        return cls()
 
 
 class WiFiProfile(Profile):
@@ -239,9 +269,12 @@ class META:
 
     def ensure_defaults(self) -> None:
         if not self.profiles:
-            self.profiles = [WAPProfile.from_dict(default_wap_dict())]
-        elif not isinstance(self.profiles[0], WAPProfile):
-            self.profiles[0] = WAPProfile.from_dict(default_wap_dict())
+            self.profiles = [OffProfile.from_dict()]
+        elif not isinstance(self.profiles[0], OffProfile):
+            # Migrate: insert off at 0 and shift existing indices
+            self.profiles.insert(0, OffProfile.from_dict())
+            for iface in self.interfaces.values():
+                iface.profile += 1
 
         seen: dict[int, str] = {}
         for name, iface in list(self.interfaces.items()):
@@ -251,14 +284,14 @@ class META:
                 iface.profile = self._next_free_default(name, seen)
             seen[iface.profile] = name
 
-    def _alloc_default_wap(self, ssid: str) -> int:
-        self.profiles.append(WAPProfile.from_dict(default_wap_dict(ssid=ssid)))
+    def _alloc_default_off(self) -> int:
+        self.profiles.append(OffProfile.from_dict())
         return len(self.profiles) - 1
 
     def _next_free_default(self, name: str, seen: dict[int, str]) -> int:
         if 0 not in seen:
             return 0
-        return self._alloc_default_wap(f"{name}-AP")
+        return self._alloc_default_off()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -309,7 +342,7 @@ class META:
             if 0 not in used:
                 idx = 0
             else:
-                idx = self._alloc_default_wap(f"{name}-AP")
+                idx = self._alloc_default_off()
             self.interfaces[name] = WirelessInterface(name, idx)
             used.add(idx)
         self.ensure_defaults()
@@ -351,7 +384,7 @@ class META:
             if 0 not in used:
                 self.interfaces[owner].profile = 0
             else:
-                self.interfaces[owner].profile = self._alloc_default_wap(f"{owner}-AP")
+                self.interfaces[owner].profile = self._alloc_default_off()
         self.ensure_defaults()
 
 
@@ -529,7 +562,8 @@ def flush_iface(iface: str) -> None:
     _run([ip, "link", "set", iface, "up"])
 
 
-def set_ap_address(iface: str, host_addr: str = DEFAULT_HOST_ADDR) -> None:
+def set_ap_address(iface: str, host_addr: str | None = None) -> None:
+    host_addr = host_addr or get_host_addr()
     ip = _which("ip")
     if not ip:
         raise RuntimeError("ip command not found")
@@ -567,18 +601,20 @@ wpa_psk={psk}
     return path
 
 
-def write_dnsmasq_conf(iface: str, host_addr: str = DEFAULT_HOST_ADDR) -> Path:
+def write_dnsmasq_conf(iface: str, host_addr: str | None = None) -> Path:
+    host_addr = host_addr or get_host_addr()
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     path = RUN_DIR / f"dnsmasq-{iface}.conf"
     prefix = ".".join(host_addr.split(".")[:3])
+    # port=0: DHCP only — NixOS services.dnsmasq owns DNS on host_addr:53
     path.write_text(
         f"""\
 interface={iface}
 bind-interfaces
+port=0
 dhcp-range={prefix}.50,{prefix}.200,255.255.255.0,12h
 dhcp-option=option:router,{host_addr}
-dhcp-option=option:dns-server,{host_addr},1.1.1.1
-cache-size=1000
+dhcp-option=option:dns-server,{host_addr}
 """
     )
     return path
@@ -684,7 +720,7 @@ def apply_wap(iface: str, profile: WAPProfile) -> None:
     uplink = pick_uplink(exclude=iface, preferred=profile.uplink)
     hap_conf = write_hostapd_conf(iface, profile)
     dns_conf = write_dnsmasq_conf(iface)
-    set_ap_address(iface, DEFAULT_HOST_ADDR)
+    set_ap_address(iface)
 
     start_child(f"hostapd-{iface}", [hostapd, str(hap_conf)])
     time.sleep(0.5)
@@ -696,6 +732,21 @@ def apply_wap(iface: str, profile: WAPProfile) -> None:
         setup_nat(iface, uplink)
 
 
+def apply_off(iface: str) -> None:
+    """Stop radio daemons and bring the interface down."""
+    stop_child(f"hostapd-{iface}")
+    stop_child(f"dnsmasq-{iface}")
+    stop_child(f"wpa-{iface}")
+    stop_child(f"dhcpcd-{iface}")
+    if _nat_pair and _nat_pair[0] == iface:
+        clear_nat()
+    flush_iface(iface)
+    ip = _which("ip")
+    if ip:
+        _run([ip, "link", "set", "dev", iface, "down"])
+
+
+
 def apply_meta(meta: META) -> list[str]:
     global _runtime
     messages: list[str] = []
@@ -704,7 +755,20 @@ def apply_meta(meta: META) -> list[str]:
     for name, iface in meta.interfaces.items():
         prof = meta.profiles[iface.profile]
         try:
-            if isinstance(prof, WiFiProfile):
+            if isinstance(prof, OffProfile):
+                apply_off(name)
+                msg = f"{name}: off"
+                messages.append(msg)
+                _runtime[name] = {
+                    "profile": iface.profile,
+                    "mode": "off",
+                    "ssid": "",
+                    "uplink": None,
+                    "ok": True,
+                    "detail": msg,
+                }
+                log_event(msg)
+            elif isinstance(prof, WiFiProfile):
                 apply_wifi(name, prof)
                 msg = f"{name}: wifi → {prof.ssid}"
                 messages.append(msg)
@@ -1119,8 +1183,8 @@ class Handler(BaseHTTPRequestHandler):
                 idx = len(_meta.profiles) - 1
             else:
                 idx = int(idx)
-                if idx == 0 and not isinstance(prof, WAPProfile):
-                    self._text(400, "profiles[0] must remain wap")
+                if idx == 0 and not isinstance(prof, OffProfile):
+                    self._text(400, "profiles[0] must remain off")
                     return
                 if idx < 0 or idx >= len(_meta.profiles):
                     self._text(400, "bad index")
@@ -1399,15 +1463,19 @@ PAGE_HTML = """<!doctype html>
           <div class="label">Mode</div>
           <div><input id="edit-mode" readonly></div>
 
-          <div class="label">SSID</div>
-          <div><input id="edit-ssid" type="text"></div>
+          <div class="label cred-row">SSID</div>
+          <div class="cred-row"><input id="edit-ssid" type="text"></div>
 
-          <div class="label">Password</div>
-          <div>
+          <div class="label cred-row">Password</div>
+          <div class="cred-row">
             <input id="edit-password" type="password">
             <label class="inline" style="margin-top:8px;">
               <input type="checkbox" id="edit-password-show"> Show
             </label>
+          </div>
+
+          <div class="span muted" id="off-note" style="display:none;">
+            Off profile: interface is powered down (no WiFi / no AP).
           </div>
 
           <div class="label wap-row">Uplink</div>
@@ -1589,7 +1657,8 @@ function fillProfileSelect() {
     let tag = "";
     if (owner && owner !== selectedIface) tag += ` [in use: ${owner}]`;
     if (activeIdx != null && i === activeIdx) tag += " [active]";
-    return `<option value="${i}" ${i === bound ? "selected" : ""}>${i}: ${p.mode} — ${p.ssid}${tag}</option>`;
+    const label = p.mode === "off" ? `${i}: off` : `${i}: ${p.mode} — ${p.ssid}`;
+    return `<option value="${i}" ${i === bound ? "selected" : ""}>${label}${tag}</option>`;
   }).join("");
 }
 
@@ -1614,19 +1683,25 @@ function showEditor(index, draft) {
     $("edit-password-show").checked = false;
     $("edit-password").type = "password";
   }
+  const isOff = p.mode === "off";
   const isWap = p.mode === "wap";
+  const isWifi = p.mode === "wifi";
+  document.querySelectorAll(".cred-row").forEach(r => { r.style.display = isOff ? "none" : ""; });
   document.querySelectorAll(".wap-row").forEach(r => { r.style.display = isWap ? "" : "none"; });
-  document.querySelectorAll(".wifi-row").forEach(r => { r.style.display = isWap ? "none" : ""; });
+  document.querySelectorAll(".wifi-row").forEach(r => { r.style.display = isWifi ? "" : "none"; });
   if (isWap) {
     fillUplinkSelect(p.uplink);
     $("edit-channel").value = p.channel ?? 149;
     $("edit-country").value = p.country_code || "IN";
-  } else {
+  } else if (isWifi) {
     $("edit-scan-ssid").checked = !!p.scan_ssid;
     $("edit-key-mgmt").value = p.key_mgmt || "WPA-PSK";
   }
   const rem = $("btn-remove");
   rem.hidden = !(index != null && index !== 0);
+  $("btn-save").hidden = isOff && index === 0; // profile 0 off is fixed
+  const note = $("off-note");
+  if (note) note.style.display = isOff ? "" : "none";
 }
 
 function openScanModal() { $("scan-modal").classList.add("open"); }
@@ -1905,12 +1980,27 @@ reload().then(() => {
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Wireless WAP/WiFi dashboard")
+    p = argparse.ArgumentParser(
+        description="Wireless WAP/WiFi dashboard",
+        add_help=False,
+    )
+    p.add_argument(
+        "--help",
+        action="help",
+        help="show this help message and exit",
+    )
     p.add_argument(
         "-c",
         "--config",
         default="./state.json",
         help="path to state.json (default: ./state.json); created if missing",
+    )
+    p.add_argument(
+        "-h",
+        "--host_addr",
+        default=DEFAULT_HOST_ADDR,
+        metavar="ADDR",
+        help=f"AP/gateway IPv4 for WAP mode (default: {DEFAULT_HOST_ADDR})",
     )
     p.add_argument(
         "--serve",
@@ -1923,8 +2013,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    global _config_path, _meta
+    global _config_path, _meta, _host_addr
     args = parse_args(argv)
+    _host_addr = args.host_addr
     _config_path = Path(args.config)
     _meta = META.load(_config_path)
     _meta.save(_config_path)
@@ -1944,7 +2035,7 @@ def main(argv: list[str] | None = None) -> int:
 
     host, port = "0.0.0.0", int(args.serve)
     server = ThreadingHTTPServer((host, port), Handler)
-    print(f"Listening on http://{host}:{port}  (config: {_config_path})", flush=True)
+    print(f"Listening on http://{host}:{port}  (config: {_config_path}, host_addr: {_host_addr})", flush=True)
 
     def _stop(signum: int, frame: Any) -> None:
         print("\nShutting down…", flush=True)
