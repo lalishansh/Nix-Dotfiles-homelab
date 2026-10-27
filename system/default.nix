@@ -1,4 +1,7 @@
 { config, lib, pkgs, ... }:
+let
+  unstable = import (builtins.fetchTarball https://github.com/NixOS/nixpkgs/archive/nixos-unstable.tar.gz) { config = { allowUnfree = true; }; };
+in
 {
   imports = [
     ./options.nix
@@ -10,6 +13,7 @@
 
   services.glance = {
     enable = true;
+    package = unstable.dynacat; # Fork of glance with additional widgets, per page authentication, etc.
     settings = {
       server.port = 5678;
       pages = [
