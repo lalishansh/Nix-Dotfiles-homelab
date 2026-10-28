@@ -11,11 +11,26 @@ in
 
   networking.networkmanager.enable = false;
 
+  # Dynacat (Glance fork): public Home + password-gated Admin (wireless UI).
+  # Docs: https://dynacat.artur.zone/#authentication/per-page-access-control
   services.glance = {
     enable = true;
-    package = unstable.dynacat; # Fork of glance with additional widgets, per page authentication, etc.
+    package = unstable.dynacat;
     settings = {
-      server.port = 5678;
+      server = {
+        port = 5678;
+        proxied = true; # behind Caddy; needed for auth brute-force IP
+      };
+      auth = {
+        # ./dynacat secret:make — rotate if this config is public
+        "secret-key" = "7mpLsWSfs4jLQT/oaF0sS2fzr388YNtQU3hCtHZCqQyLEGZirbO4H0nBcZlbveDi9BcMsnpI1TFNnB/KNnxs8w==";
+        "require-auth" = false; # Home public; Admin still needs login
+        users = {
+          admin = {
+            password = "123412341234";
+          };
+        };
+      };
       pages = [
         {
           name = "Home";
@@ -28,12 +43,23 @@ in
                   type = "weather";
                   location = "Bengaluru, India";
                 }
+              ];
+            }
+          ];
+        }
+        {
+          name = "Admin";
+          "allowed-users" = [ "admin" ];
+          columns = [
+            {
+              size = "full";
+              widgets = [
                 {
                   type = "iframe";
                   title = "Wireless";
-                  # Same origin as Glance (dashboard.lan) so iframe can sync theme vars
+                  # Same origin as dashboard.lan so iframe can sync theme vars
                   source = "http://dashboard.${config.host_domain}/wireless";
-                  height = 720;
+                  height = 756;
                 }
               ];
             }

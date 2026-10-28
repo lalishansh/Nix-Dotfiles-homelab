@@ -24,6 +24,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1170,6 +1171,30 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "messages": msgs})
             return
 
+        if path == "/api/power":
+            try:
+                data = self._read_json()
+            except json.JSONDecodeError:
+                self._text(400, "invalid json")
+                return
+            action = (data.get("action") or "").strip()
+            if action not in ("reboot", "poweroff"):
+                self._text(400, "action must be reboot or poweroff")
+                return
+            cmd = ["systemctl", action]
+            log_event(f"Power: {action}")
+            self._json(200, {"ok": True, "action": action})
+            # Respond first, then schedule so the client gets the reply.
+            def _run() -> None:
+                time.sleep(0.4)
+                try:
+                    subprocess.Popen(cmd)  # noqa: S603
+                except OSError as e:
+                    log_event(f"Power {action} failed: {e}")
+
+            threading.Thread(target=_run, daemon=True).start()
+            return
+
         if path == "/api/profiles":
             try:
                 data = self._read_json()
@@ -1291,7 +1316,8 @@ body { padding: 14px; }
 }
 .grid .label { color: var(--color-text-base-muted); font-size: 12px; font-weight: 500; }
 .grid .span { grid-column: 1 / -1; }
-.grid .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; }
+.actions button { flex: 1 1 0; min-width: 0; text-align: center; }
 
 select, input[type=text], input[type=password], input[type=number] {
   width: 100%; padding: 8px 10px;
@@ -1444,8 +1470,7 @@ PAGE_HTML = """<!doctype html>
           <div class="label">Profile</div>
           <div><select id="profile"></select></div>
 
-          <div class="label">Actions</div>
-          <div class="actions">
+          <div class="span actions">
             <button type="button" id="btn-scan">Scan for WiFi</button>
             <button type="button" id="btn-wap">New WAP profile</button>
             <button type="button" class="primary" id="btn-apply">Apply</button>
@@ -1496,7 +1521,7 @@ PAGE_HTML = """<!doctype html>
           <div class="wifi-row"><input id="edit-key-mgmt" type="text" value="WPA-PSK"></div>
 
           <div class="span actions">
-            <button type="button" class="primary" id="btn-save">Save profile</button>
+            <button type="button" class="primary" id="btn-save">Save &amp; Apply profile</button>
             <button type="button" class="danger" id="btn-remove" hidden>Remove profile</button>
           </div>
         </div>
@@ -1505,6 +1530,18 @@ PAGE_HTML = """<!doctype html>
 
     <p id="status" title="Click to open logs">No interfaces applied yet.</p>
     <p id="flash"></p>
+
+    <section class="widget">
+      <div class="widget-header">
+        <h2><span class="title-accent">System</span> · power</h2>
+      </div>
+      <div class="widget-body">
+        <div class="span actions">
+          <button type="button" id="btn-reboot">Restart</button>
+          <button type="button" class="danger" id="btn-poweroff">Shutdown</button>
+        </div>
+      </div>
+    </section>
   </div>
 
   <div id="log-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="log-modal-title">
@@ -1901,6 +1938,20 @@ $("btn-remove").addEventListener("click", async () => {
   }
 });
 
+async function applyProfiles() {
+  setFlash("Applying…");
+  try {
+    const res = await api("/api/apply", { method: "POST" });
+    setFlash((res.messages || []).join(" · ") || "Applied.");
+    await refreshConnectionStatus();
+    return true;
+  } catch (e) {
+    setFlash("Apply failed: " + e.message);
+    await refreshConnectionStatus();
+    return false;
+  }
+}
+
 $("btn-save").addEventListener("click", async () => {
   const mode = $("edit-mode").value;
   let profile;
@@ -1949,22 +2000,30 @@ $("btn-save").addEventListener("click", async () => {
     fillProfileSelect();
     showEditor(idx);
     setStatus("Saved profile " + idx);
+    await applyProfiles();
   } catch (e) {
     setStatus("Save failed: " + e.message);
   }
 });
 
-$("btn-apply").addEventListener("click", async () => {
-  setFlash("Applying…");
+$("btn-apply").addEventListener("click", () => applyProfiles());
+
+async function requestPower(action, label) {
+  if (!confirm(`${label} this machine now?`)) return;
+  setFlash(`${label}…`);
   try {
-    const res = await api("/api/apply", { method: "POST" });
-    setFlash((res.messages || []).join(" · ") || "Applied.");
-    await refreshConnectionStatus();
+    await api("/api/power", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    });
+    setFlash(`${label} requested.`);
   } catch (e) {
-    setFlash("Apply failed: " + e.message);
-    await refreshConnectionStatus();
+    setFlash(`${label} failed: ` + e.message);
   }
-});
+}
+$("btn-reboot").addEventListener("click", () => requestPower("reboot", "Restart"));
+$("btn-poweroff").addEventListener("click", () => requestPower("poweroff", "Shutdown"));
 
 watchGlanceTheme();
 reload().then(() => {
