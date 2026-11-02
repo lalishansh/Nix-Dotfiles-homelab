@@ -40,8 +40,6 @@ DEFAULT_HOST_ADDR = "192.168.12.1"
 _host_addr: str = DEFAULT_HOST_ADDR
 DEFAULT_COUNTRY = "IN"
 DEFAULT_CHANNEL = 149
-DEFAULT_CHANNEL_24 = 6
-DEFAULT_WAP_BAND = "5"  # "5" → hw_mode=a; "2.4" → hw_mode=g (wider client support)
 DEFAULT_WAP_SSID = "BloodPoint"
 DEFAULT_WAP_PASSWORD = "12345678"
 RUN_DIR = Path(os.environ.get("SYSTEM_DASHBOARD_RUN", "/run/wireless-dashboard"))
@@ -57,9 +55,6 @@ _activity_log: list[dict[str, str]] = []
 _LOG_MAX = 200
 # iface -> {profile, mode, ssid, uplink, ok, detail}
 _runtime: dict[str, dict[str, Any]] = {}
-# Last successful Wi‑Fi scan (shared across ifaces — environment-wide).
-SCAN_CACHE_TTL_SEC = 60
-_scan_cache: dict[str, Any] | None = None  # {ts: float, result: dict}
 
 
 def log_event(msg: str) -> None:
@@ -124,7 +119,6 @@ def default_wap_dict(ssid: str | None = None) -> dict[str, Any]:
         "ssid": ssid or DEFAULT_WAP_SSID,
         "password": DEFAULT_WAP_PASSWORD,
         "uplink": None,
-        "band": DEFAULT_WAP_BAND,
         "channel": DEFAULT_CHANNEL,
         "country_code": DEFAULT_COUNTRY,
     }
@@ -224,17 +218,10 @@ class WAPProfile(Profile):
         uplink: str | None = None,
         channel: int = DEFAULT_CHANNEL,
         country_code: str = DEFAULT_COUNTRY,
-        band: str = DEFAULT_WAP_BAND,
     ) -> None:
         super().__init__(ssid, password)
         self.uplink = uplink
-        self.band = "2.4" if str(band) in ("2.4", "24", "g", "2ghz", "2.4ghz") else "5"
-        ch = int(channel)
-        # Keep channel in-band if possible; otherwise use a sensible default.
-        if self.band == "2.4":
-            self.channel = ch if 1 <= ch <= 14 else DEFAULT_CHANNEL_24
-        else:
-            self.channel = ch if ch >= 36 else DEFAULT_CHANNEL
+        self.channel = int(channel)
         self.country_code = country_code or DEFAULT_COUNTRY
 
     def to_dict(self) -> dict[str, Any]:
@@ -245,7 +232,6 @@ class WAPProfile(Profile):
             "uplink": self.uplink,
             "channel": self.channel,
             "country_code": self.country_code,
-            "band": self.band,
         }
 
     @classmethod
@@ -256,7 +242,6 @@ class WAPProfile(Profile):
             uplink=data.get("uplink"),
             channel=int(data.get("channel", DEFAULT_CHANNEL)),
             country_code=str(data.get("country_code", DEFAULT_COUNTRY)),
-            band=str(data.get("band", DEFAULT_WAP_BAND)),
         )
 
 
@@ -591,25 +576,6 @@ def write_hostapd_conf(iface: str, profile: WAPProfile) -> Path:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     path = RUN_DIR / f"hostapd-{iface}.conf"
     psk = wpa_psk_hex(profile.ssid, profile.password)
-    if profile.band == "2.4":
-        # g + n only — widest client compatibility (no ac/ax on 2.4)
-        radio = f"""\
-hw_mode=g
-channel={profile.channel}
-ieee80211d=1
-ieee80211n=1
-wmm_enabled=1
-"""
-    else:
-        radio = f"""\
-hw_mode=a
-channel={profile.channel}
-ieee80211d=1
-ieee80211n=1
-ieee80211ac=1
-ieee80211ax=1
-wmm_enabled=1
-"""
     path.write_text(
         f"""\
 ctrl_interface={RUN_DIR}/hostapd
@@ -618,7 +584,14 @@ interface={iface}
 driver=nl80211
 ssid={profile.ssid}
 country_code={profile.country_code}
-{radio}auth_algs=1
+hw_mode=a
+channel={profile.channel}
+ieee80211d=1
+ieee80211n=1
+ieee80211ac=1
+ieee80211ax=1
+wmm_enabled=1
+auth_algs=1
 wpa=2
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
@@ -633,7 +606,6 @@ def write_dnsmasq_conf(iface: str, host_addr: str | None = None) -> Path:
     host_addr = host_addr or get_host_addr()
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     path = RUN_DIR / f"dnsmasq-{iface}.conf"
-    lease = RUN_DIR / f"dnsmasq-{iface}.leases"
     prefix = ".".join(host_addr.split(".")[:3])
     # port=0: DHCP only — NixOS services.dnsmasq owns DNS on host_addr:53
     path.write_text(
@@ -644,126 +616,9 @@ port=0
 dhcp-range={prefix}.50,{prefix}.200,255.255.255.0,12h
 dhcp-option=option:router,{host_addr}
 dhcp-option=option:dns-server,{host_addr}
-dhcp-leasefile={lease}
 """
     )
     return path
-
-
-def _hostapd_stations(iface: str) -> dict[str, dict[str, Any]]:
-    """MAC → station info from hostapd_cli all_sta."""
-    out: dict[str, dict[str, Any]] = {}
-    cli = _which("hostapd_cli")
-    if not cli:
-        return out
-    ctrl = RUN_DIR / "hostapd"
-    r = _run([cli, "-p", str(ctrl), "-i", iface, "all_sta"])
-    if r.returncode != 0 or not (r.stdout or "").strip():
-        return out
-    mac: str | None = None
-    cur: dict[str, Any] = {}
-    for line in (r.stdout or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", line, re.I):
-            if mac:
-                out[mac] = cur
-            mac = line.lower()
-            cur = {"mac": mac, "associated": True}
-            continue
-        if mac and "=" in line:
-            k, _, v = line.partition("=")
-            cur[k.strip()] = v.strip()
-    if mac:
-        out[mac] = cur
-    return out
-
-
-def _dnsmasq_leases(iface: str) -> dict[str, dict[str, Any]]:
-    """MAC → lease info from dhcp-leasefile."""
-    out: dict[str, dict[str, Any]] = {}
-    path = RUN_DIR / f"dnsmasq-{iface}.leases"
-    if not path.is_file():
-        return out
-    now = time.time()
-    try:
-        text = path.read_text()
-    except OSError:
-        return out
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        # expiry mac ip hostname [client-id]
-        try:
-            expiry = int(parts[0])
-        except ValueError:
-            continue
-        mac = parts[1].lower()
-        ip = parts[2]
-        hostname = parts[3]
-        if hostname in ("*", ""):
-            hostname = ""
-        out[mac] = {
-            "mac": mac,
-            "ip": ip,
-            "hostname": hostname,
-            "lease_expires": expiry,
-            "lease_active": expiry == 0 or expiry > now,
-        }
-    return out
-
-
-def _neigh_ips(iface: str) -> dict[str, str]:
-    """MAC → IPv4 from the neighbor table on iface."""
-    out: dict[str, str] = {}
-    ip = _which("ip")
-    if not ip:
-        return out
-    r = _run([ip, "-4", "neigh", "show", "dev", iface])
-    for line in (r.stdout or "").splitlines():
-        # 192.168.12.50 lladdr aa:bb:… REACHABLE
-        m = re.search(
-            r"^(\d+\.\d+\.\d+\.\d+)\s+lladdr\s+((?:[0-9a-f]{2}:){5}[0-9a-f]{2})",
-            line,
-            re.I,
-        )
-        if m:
-            out[m.group(2).lower()] = m.group(1)
-    return out
-
-
-def list_wap_clients(iface: str) -> dict[str, Any]:
-    """Connected / leased devices on a WAP interface."""
-    stations = _hostapd_stations(iface)
-    leases = _dnsmasq_leases(iface)
-    neigh = _neigh_ips(iface)
-    macs = sorted(set(stations) | set(leases) | set(neigh))
-    clients: list[dict[str, Any]] = []
-    for mac in macs:
-        st = stations.get(mac) or {}
-        lease = leases.get(mac) or {}
-        ip = lease.get("ip") or neigh.get(mac) or ""
-        hostname = lease.get("hostname") or ""
-        signal = st.get("signal") or st.get("rx_signal") or ""
-        clients.append(
-            {
-                "mac": mac,
-                "ip": ip,
-                "hostname": hostname,
-                "associated": bool(st.get("associated")),
-                "signal": signal,
-                "lease_active": bool(lease.get("lease_active")),
-                "lease_expires": lease.get("lease_expires"),
-            }
-        )
-    return {
-        "iface": iface,
-        "clients": clients,
-        "count": len(clients),
-        "associated": sum(1 for c in clients if c["associated"]),
-    }
 
 
 def write_wpa_conf(iface: str, profile: WiFiProfile) -> Path:
@@ -1116,141 +971,32 @@ def _scan_via_iw(iface: str) -> tuple[list[dict[str, Any]], str | None]:
     return _parse_iw_scan(r.stdout), None
 
 
-def _iface_is_active_wap(name: str) -> bool:
-    return (_runtime.get(name) or {}).get("mode") == "wap"
-
-
-def _other_wifi_ifaces(exclude: str) -> list[str]:
-    return [
-        i["name"]
-        for i in list_net_ifaces()
-        if i.get("kind") == "wifi" and i["name"] != exclude
-    ]
-
-
-def _scan_cache_get() -> dict[str, Any] | None:
-    global _scan_cache
-    if not _scan_cache:
-        return None
-    age = time.time() - float(_scan_cache["ts"])
-    if age > SCAN_CACHE_TTL_SEC:
-        return None
-    result = dict(_scan_cache["result"])
-    result["cached"] = True
-    result["cache_age_sec"] = int(age)
-    result["cache_ttl_sec"] = SCAN_CACHE_TTL_SEC
-    return result
-
-
-def _scan_cache_put(result: dict[str, Any]) -> None:
-    """Store successful / usable scans only (not soft needs_disrupt failures)."""
-    global _scan_cache
-    if result.get("needs_disrupt"):
-        return
-    # Cache even empty lists from a real scan method — still useful briefly
-    if not result.get("method") and result.get("error"):
-        return
-    stored = {k: v for k, v in result.items() if k not in ("cached", "cache_age_sec", "cache_ttl_sec")}
-    _scan_cache = {"ts": time.time(), "result": stored}
-
-
-def scan_wifi(
-    iface: str,
-    *,
-    allow_disrupt: bool = False,
-    force: bool = False,
-) -> dict[str, Any]:
-    """Scan for APs.
-
-    Prefer wpa_cli on the given iface. If that iface is an active WAP, prefer
-    scanning on another Wi‑Fi radio first (keeps AP clients connected).
-    Tearing down hostapd on a single-radio AP requires allow_disrupt=True.
-
-    Within SCAN_CACHE_TTL_SEC, returns the last successful scan unless force=True
-    (avoids re-disrupting WAP clients on repeated clicks / page reloads).
-    """
-    if not force:
-        cached = _scan_cache_get()
-        if cached is not None:
-            return cached
-
-    def _finish(result: dict[str, Any]) -> dict[str, Any]:
-        result.setdefault("cached", False)
-        result.setdefault("cache_ttl_sec", SCAN_CACHE_TTL_SEC)
-        _scan_cache_put(result)
-        return result
-
+def scan_wifi(iface: str) -> dict[str, Any]:
+    """Scan for APs. Uses wpa_cli when wpa_supplicant owns the iface;
+    otherwise briefly stops hostapd/dnsmasq so iw can scan."""
     # Prefer wpa_cli — works while associated / scanning as client
     via_wpa = _scan_via_wpa_cli(iface)
     if via_wpa is not None:
-        return _finish({
+        return {
             "networks": _enrich_scan_networks(via_wpa),
             "method": "wpa_cli",
-            "iface": iface,
             "error": None,
-            "disrupted": False,
-        })
-
-    # Active WAP on this radio: try another wifi iface before disrupting clients
-    if _iface_is_active_wap(iface):
-        for alt in _other_wifi_ifaces(iface):
-            if _iface_is_active_wap(alt):
-                continue
-            via = _scan_via_wpa_cli(alt)
-            if via is not None:
-                return _finish({
-                    "networks": _enrich_scan_networks(via),
-                    "method": "wpa_cli",
-                    "iface": alt,
-                    "error": None,
-                    "disrupted": False,
-                    "note": f"Scanned on {alt} to keep WAP up on {iface}",
-                })
-            nets, err = _scan_via_iw(alt)
-            if nets and not err:
-                return _finish({
-                    "networks": _enrich_scan_networks(nets),
-                    "method": "iw",
-                    "iface": alt,
-                    "error": None,
-                    "disrupted": False,
-                    "note": f"Scanned on {alt} to keep WAP up on {iface}",
-                })
-        if not allow_disrupt:
-            # Soft-fail is not cached — so a later force/disrupt can still run
-            return {
-                "networks": [],
-                "method": None,
-                "iface": iface,
-                "error": (
-                    f"{iface} is an active WAP — scanning it stops the AP and "
-                    "disconnects clients (including anyone on this dashboard via Wi‑Fi). "
-                    "Retry with allow_disrupt=1, use Tailscale/ethernet while scanning, "
-                    "or add a second Wi‑Fi radio."
-                ),
-                "disrupted": False,
-                "needs_disrupt": True,
-                "cached": False,
-                "cache_ttl_sec": SCAN_CACHE_TTL_SEC,
-            }
+        }
 
     # Free radio from AP mode if needed
     had_hostapd = (RUN_DIR / f"hostapd-{iface}.pid").exists() or f"hostapd-{iface}" in _children
     had_dnsmasq = (RUN_DIR / f"dnsmasq-{iface}.pid").exists() or f"dnsmasq-{iface}" in _children
-    disrupted = False
     if had_hostapd:
         stop_child(f"hostapd-{iface}")
-        disrupted = True
     if had_dnsmasq:
         stop_child(f"dnsmasq-{iface}")
-        disrupted = True
-    if disrupted:
+    if had_hostapd or had_dnsmasq:
         time.sleep(0.5)
 
     nets, err = _scan_via_iw(iface)
 
     # Restore AP if we tore it down
-    if disrupted and _meta is not None:
+    if (had_hostapd or had_dnsmasq) and _meta is not None:
         iface_state = _meta.interfaces.get(iface)
         if iface_state is not None:
             prof = _meta.profiles[iface_state.profile]
@@ -1260,13 +1006,11 @@ def scan_wifi(
                 except Exception as e:  # noqa: BLE001
                     err = (err + "; " if err else "") + f"restore AP failed: {e}"
 
-    return _finish({
+    return {
         "networks": _enrich_scan_networks(nets),
         "method": "iw",
-        "iface": iface,
         "error": err,
-        "disrupted": disrupted,
-    })
+    }
 
 
 # =============================================================================
@@ -1355,32 +1099,8 @@ class Handler(BaseHTTPRequestHandler):
             if not iface:
                 self._text(400, "iface required")
                 return
-            disrupt = (qs.get("allow_disrupt") or ["0"])[0] in ("1", "true", "yes")
-            force = (qs.get("force") or ["0"])[0] in ("1", "true", "yes")
-            # Disruptive scan implies a fresh radio pass
-            if disrupt:
-                force = True
-            log_event(
-                f"Scan requested on {iface} (allow_disrupt={disrupt}, force={force})"
-            )
-            self._json(
-                200,
-                scan_wifi(iface, allow_disrupt=disrupt, force=force),
-            )
-            return
-        if path == "/api/clients":
-            iface = (qs.get("iface") or [None])[0]
-            if not iface:
-                self._text(400, "iface required")
-                return
-            rt = _runtime.get(iface) or {}
-            if rt.get("mode") != "wap":
-                self._json(
-                    409,
-                    {"error": f"{iface} is not in active WAP mode", "clients": []},
-                )
-                return
-            self._json(200, list_wap_clients(iface))
+            log_event(f"Scan requested on {iface}")
+            self._json(200, scan_wifi(iface))
             return
         if path == "/api/status":
             self._json(200, status_payload())
@@ -1670,13 +1390,11 @@ button:disabled { opacity: 0.45; cursor: default; }
 .modal header {
   display: flex; justify-content: space-between; align-items: center;
   padding: 12px 14px; border-bottom: 1px solid var(--color-separator);
-  gap: 8px;
 }
 .modal header h2 {
   margin: 0; font-size: 13px; font-weight: 600; letter-spacing: 0.02em;
   text-transform: uppercase; color: var(--color-primary);
 }
-.modal header .header-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
 .modal .body { padding: 4px 0; }
 .modal footer {
   padding: 10px 14px; border-top: 1px solid var(--color-separator);
@@ -1754,7 +1472,6 @@ PAGE_HTML = """<!doctype html>
 
           <div class="span actions">
             <button type="button" id="btn-scan">Scan for WiFi</button>
-            <button type="button" id="btn-clients" hidden>Connected Devices</button>
             <button type="button" id="btn-wap">New WAP profile</button>
             <button type="button" class="primary" id="btn-apply">Apply</button>
           </div>
@@ -1788,14 +1505,6 @@ PAGE_HTML = """<!doctype html>
 
           <div class="label wap-row">Uplink</div>
           <div class="wap-row"><select id="edit-uplink"></select></div>
-
-          <div class="label wap-row">Band</div>
-          <div class="wap-row">
-            <select id="edit-band">
-              <option value="5">5 GHz</option>
-              <option value="2.4">2.4 GHz (wider compatibility)</option>
-            </select>
-          </div>
 
           <div class="label wap-row">Channel</div>
           <div class="wap-row"><input id="edit-channel" type="number"></div>
@@ -1850,10 +1559,7 @@ PAGE_HTML = """<!doctype html>
     <div class="modal">
       <header>
         <h2 id="scan-modal-title">Available networks</h2>
-        <div class="header-actions">
-          <button type="button" id="btn-scan-rescan">Rescan</button>
-          <button type="button" id="btn-scan-close">Close</button>
-        </div>
+        <button type="button" id="btn-scan-close">Close</button>
       </header>
       <p id="scan-hint"></p>
       <div class="body">
@@ -1863,26 +1569,6 @@ PAGE_HTML = """<!doctype html>
         </table>
       </div>
       <footer>Saved → switch profile. New → create. Open networks marked unsafe.</footer>
-    </div>
-  </div>
-
-  <div id="clients-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="clients-modal-title">
-    <div class="modal">
-      <header>
-        <h2 id="clients-modal-title">Connected devices</h2>
-        <div class="header-actions">
-          <button type="button" id="btn-clients-rescan">Rescan</button>
-          <button type="button" id="btn-clients-close">Close</button>
-        </div>
-      </header>
-      <p id="clients-hint"></p>
-      <div class="body">
-        <table class="nets">
-          <thead><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Status</th></tr></thead>
-          <tbody id="clients-body"></tbody>
-        </table>
-      </div>
-      <footer>From hostapd stations + DHCP leases. Re-open to refresh.</footer>
     </div>
   </div>
 
@@ -1897,7 +1583,6 @@ let netIfaces = [];
 let selectedIface = "";
 let editingIndex = null;
 let activeProfiles = {}; // iface -> profile index currently applied
-let activeModes = {}; // iface -> applied mode (off|wifi|wap)
 const BASE = "__BASE_PATH__"; // filled by server (e.g. /wireless)
 
 const $ = (id) => document.getElementById(id);
@@ -1955,29 +1640,13 @@ async function refreshConnectionStatus() {
   try {
     const data = await api("/api/status");
     activeProfiles = data.active_profiles || {};
-    activeModes = {};
-    const rt = data.runtime || {};
-    for (const [iface, info] of Object.entries(rt)) {
-      activeModes[iface] = info.mode || "";
-    }
     $("status").textContent = data.summary || "No status.";
     fillProfileSelect();
-    updateClientsButton();
     return data;
   } catch (e) {
     $("status").textContent = "Status unavailable: " + e.message;
     return null;
   }
-}
-
-function updateClientsButton() {
-  const btn = $("btn-clients");
-  if (!btn) return;
-  const idx = state.interfaces[selectedIface]?.profile;
-  const prof = idx != null ? state.profiles[idx] : null;
-  const selectedIsWap = prof && prof.mode === "wap";
-  const activeIsWap = activeModes[selectedIface] === "wap";
-  btn.hidden = !(selectedIsWap && activeIsWap);
 }
 
 function openLogModal(logs) {
@@ -2059,8 +1728,7 @@ function showEditor(index, draft) {
   document.querySelectorAll(".wifi-row").forEach(r => { r.style.display = isWifi ? "" : "none"; });
   if (isWap) {
     fillUplinkSelect(p.uplink);
-    $("edit-band").value = p.band === "2.4" ? "2.4" : "5";
-    $("edit-channel").value = p.channel ?? (p.band === "2.4" ? 6 : 149);
+    $("edit-channel").value = p.channel ?? 149;
     $("edit-country").value = p.country_code || "IN";
   } else if (isWifi) {
     $("edit-scan-ssid").checked = !!p.scan_ssid;
@@ -2071,13 +1739,10 @@ function showEditor(index, draft) {
   $("btn-save").hidden = isOff && index === 0; // profile 0 off is fixed
   const note = $("off-note");
   if (note) note.style.display = isOff ? "" : "none";
-  updateClientsButton();
 }
 
 function openScanModal() { $("scan-modal").classList.add("open"); }
 function closeScanModal() { $("scan-modal").classList.remove("open"); }
-function openClientsModal() { $("clients-modal").classList.add("open"); }
-function closeClientsModal() { $("clients-modal").classList.remove("open"); }
 
 function pickNetwork(draft) {
   closeScanModal();
@@ -2134,7 +1799,6 @@ $("iface").addEventListener("change", () => {
   fillProfileSelect();
   const idx = state.interfaces[selectedIface]?.profile;
   if (idx != null) showEditor(idx);
-  updateClientsButton();
 });
 
 $("profile").addEventListener("change", async () => {
@@ -2147,192 +1811,83 @@ $("profile").addEventListener("change", async () => {
     });
     fillProfileSelect();
     showEditor(idx);
-    updateClientsButton();
     setStatus(`Bound ${selectedIface} → profile ${idx}`);
   } catch (e) {
     setStatus("Error: " + e.message);
     fillProfileSelect();
-    updateClientsButton();
   }
 });
 
-async function loadClients() {
+$("btn-scan").addEventListener("click", async () => {
   if (!selectedIface) return;
-  $("clients-hint").textContent = "Loading clients on " + selectedIface + "…";
-  $("clients-body").innerHTML = "";
+  setStatus("Scanning…");
+  openScanModal();
+  $("scan-hint").textContent = "Scanning " + selectedIface + "…";
+  $("scan-body").innerHTML = "";
   try {
-    const data = await api(`/api/clients?iface=${encodeURIComponent(selectedIface)}`);
-    const clients = data.clients || [];
-    const assoc = data.associated != null ? data.associated : clients.filter(c => c.associated).length;
-    $("clients-hint").textContent =
-      `${clients.length} device(s) · ${assoc} associated on ${selectedIface}`;
-    const body = $("clients-body");
-    if (!clients.length) {
+    const data = await api(`/api/scan?iface=${encodeURIComponent(selectedIface)}`);
+    const body = $("scan-body");
+    const nets = data.networks || [];
+    let hint = `Found ${nets.length} network(s)`;
+    if (data.method) hint += ` via ${data.method}`;
+    if (data.error) hint += ` — ${data.error}`;
+    $("scan-hint").textContent = hint;
+
+    for (const n of nets) {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td colspan="4" class="muted">No stations or leases yet.</td>`;
-      body.appendChild(tr);
-    }
-    for (const c of clients) {
-      const tr = document.createElement("tr");
-      const tags = [];
-      if (c.associated) tags.push('<span class="tag saved">Associated</span>');
-      if (c.lease_active) tags.push('<span class="tag">DHCP</span>');
-      if (c.signal) tags.push('<span class="muted">' + c.signal + " dBm</span>");
-      const dash = '<span class="muted">—</span>';
-      tr.innerHTML =
-        "<td>" + (c.hostname || dash) + "</td>" +
-        "<td>" + (c.ip || dash) + "</td>" +
-        "<td><code>" + (c.mac || "") + "</code></td>" +
-        "<td>" + (tags.join(" ") || dash) + "</td>";
-      body.appendChild(tr);
-    }
-  } catch (e) {
-    $("clients-hint").textContent = "Failed: " + e.message;
-  }
-}
-
-$("btn-clients").addEventListener("click", async () => {
-  if (!selectedIface) return;
-  openClientsModal();
-  await loadClients();
-});
-$("btn-clients-rescan").addEventListener("click", () => loadClients());
-
-const SCAN_CACHE_KEY = "system-dashboard-last-scan";
-
-function renderScanResults(data) {
-  const body = $("scan-body");
-  body.innerHTML = "";
-  const nets = data.networks || [];
-  let hint = `Found ${nets.length} network(s)`;
-  if (data.iface) hint += ` on ${data.iface}`;
-  if (data.method) hint += ` via ${data.method}`;
-  if (data.cached) hint += ` · cached ${data.cache_age_sec ?? 0}s ago (ttl ${data.cache_ttl_sec ?? "?"}s)`;
-  if (data.note) hint += ` — ${data.note}`;
-  if (data.disrupted) hint += " — AP was briefly stopped";
-  if (data.error) hint += ` — ${data.error}`;
-  $("scan-hint").textContent = hint;
-
-  for (const n of nets) {
-    const tr = document.createElement("tr");
-    const saved = n.saved_profiles || [];
-    tr.className = "pick" + (saved.length ? " saved" : "");
-    tr.innerHTML = `<td>${n.ssid || "(hidden)"}</td><td>${signalLabel(n.signal)}</td><td>${statusTags(n)}</td>`;
-    tr.addEventListener("click", () => {
-      if (saved.length) {
-        switchToSavedProfile(saved[0]);
-        if (n.password_on_open) {
-          setStatus(`Profile #${saved[0]}: network is OPEN but profile has a password — unsafe`);
+      const saved = n.saved_profiles || [];
+      tr.className = "pick" + (saved.length ? " saved" : "");
+      tr.innerHTML = `<td>${n.ssid || "(hidden)"}</td><td>${signalLabel(n.signal)}</td><td>${statusTags(n)}</td>`;
+      tr.addEventListener("click", () => {
+        if (saved.length) {
+          switchToSavedProfile(saved[0]);
+          if (n.password_on_open) {
+            setStatus(`Profile #${saved[0]}: network is OPEN but profile has a password — unsafe`);
+          }
+          return;
         }
-        return;
-      }
-      if (n.open) {
+        if (n.open) {
+          pickNetwork({
+            mode: "wifi",
+            ssid: n.ssid,
+            password: "",
+            scan_ssid: false,
+            key_mgmt: "NONE",
+          });
+          setStatus(`Open network ${n.ssid} — marked unsafe; Save to create profile`);
+          return;
+        }
         pickNetwork({
           mode: "wifi",
           ssid: n.ssid,
           password: "",
           scan_ssid: false,
-          key_mgmt: "NONE",
+          key_mgmt: "WPA-PSK",
         });
-        setStatus(`Open network ${n.ssid} — marked unsafe; Save to create profile`);
-        return;
-      }
+        setStatus(`Selected ${n.ssid} (${signalLabel(n.signal)}) — enter password and Save`);
+      });
+      body.appendChild(tr);
+    }
+    const hidden = document.createElement("tr");
+    hidden.className = "pick";
+    hidden.innerHTML = `<td><em>Connect to Hidden WiFi</em></td><td></td><td></td>`;
+    hidden.addEventListener("click", () => {
       pickNetwork({
         mode: "wifi",
-        ssid: n.ssid,
+        ssid: "",
         password: "",
-        scan_ssid: false,
+        scan_ssid: true,
         key_mgmt: "WPA-PSK",
       });
-      setStatus(`Selected ${n.ssid} (${signalLabel(n.signal)}) — enter password and Save`);
+      setStatus("Hidden WiFi — enter SSID/password and Save");
     });
-    body.appendChild(tr);
-  }
-  const hidden = document.createElement("tr");
-  hidden.className = "pick";
-  hidden.innerHTML = `<td><em>Connect to Hidden WiFi</em></td><td></td><td></td>`;
-  hidden.addEventListener("click", () => {
-    pickNetwork({
-      mode: "wifi",
-      ssid: "",
-      password: "",
-      scan_ssid: true,
-      key_mgmt: "WPA-PSK",
-    });
-    setStatus("Hidden WiFi — enter SSID/password and Save");
-  });
-  body.appendChild(hidden);
-  setStatus(hint);
-  try { sessionStorage.setItem(SCAN_CACHE_KEY, JSON.stringify(data)); } catch (_) {}
-}
-
-$("edit-band").addEventListener("change", () => {
-  const band = $("edit-band").value;
-  const ch = parseInt($("edit-channel").value, 10);
-  if (band === "2.4" && (!(ch >= 1 && ch <= 14))) $("edit-channel").value = 6;
-  if (band === "5" && (!(ch >= 36))) $("edit-channel").value = 149;
-});
-
-async function runWifiScan({ force = false } = {}) {
-  if (!selectedIface) return;
-  $("scan-hint").textContent = (force ? "Rescanning " : "Scanning ") + selectedIface + "…";
-  if (force) $("scan-body").innerHTML = "";
-
-  if (activeModes[selectedIface] === "wap") {
-    setStatus(force ? "Rescanning (may stop AP)…" : "Scanning without stopping AP…");
-    try {
-      let data = await api(
-        `/api/scan?iface=${encodeURIComponent(selectedIface)}` +
-        (force ? "&force=1" : "")
-      );
-      if (data.needs_disrupt) {
-        const ok = confirm(
-          "This radio is running as a WAP. Scanning it will briefly stop the AP and disconnect Wi‑Fi clients " +
-          "(including this page if you are on the WAP).\n\n" +
-          "Prefer: open the dashboard over Tailscale/ethernet, or use a second Wi‑Fi radio.\n\n" +
-          "Stop AP and scan anyway?"
-        );
-        if (!ok) {
-          $("scan-hint").textContent = data.error || "Scan cancelled (AP left running).";
-          try {
-            const cached = JSON.parse(sessionStorage.getItem(SCAN_CACHE_KEY) || "null");
-            if (cached && cached.networks) renderScanResults(cached);
-          } catch (_) {}
-          return;
-        }
-        data = await api(
-          `/api/scan?iface=${encodeURIComponent(selectedIface)}&allow_disrupt=1&force=1`
-        );
-      }
-      renderScanResults(data);
-      return;
-    } catch (e) {
-      $("scan-hint").textContent = "Scan failed: " + e.message;
-      setStatus("Scan failed: " + e.message);
-      return;
-    }
-  }
-
-  setStatus(force ? "Rescanning…" : "Scanning…");
-  try {
-    const data = await api(
-      `/api/scan?iface=${encodeURIComponent(selectedIface)}` +
-      (force ? "&force=1" : "")
-    );
-    renderScanResults(data);
+    body.appendChild(hidden);
+    setStatus(hint);
   } catch (e) {
     $("scan-hint").textContent = "Scan failed: " + e.message;
     setStatus("Scan failed: " + e.message);
   }
-}
-
-$("btn-scan").addEventListener("click", async () => {
-  if (!selectedIface) return;
-  openScanModal();
-  $("scan-body").innerHTML = "";
-  await runWifiScan({ force: false });
 });
-$("btn-scan-rescan").addEventListener("click", () => runWifiScan({ force: true }));
 
 $("status").addEventListener("click", async () => {
   setFlash("Loading logs…");
@@ -2345,16 +1900,12 @@ $("log-modal").addEventListener("click", (e) => {
   if (e.target === $("log-modal")) closeLogModal();
 });
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { closeLogModal(); closeScanModal(); closeClientsModal(); }
+  if (e.key === "Escape") { closeLogModal(); closeScanModal(); }
 });
 
 $("btn-scan-close").addEventListener("click", closeScanModal);
 $("scan-modal").addEventListener("click", (e) => {
   if (e.target === $("scan-modal")) closeScanModal();
-});
-$("btn-clients-close").addEventListener("click", closeClientsModal);
-$("clients-modal").addEventListener("click", (e) => {
-  if (e.target === $("clients-modal")) closeClientsModal();
 });
 
 $("btn-wap").addEventListener("click", () => {
@@ -2363,7 +1914,6 @@ $("btn-wap").addEventListener("click", () => {
     ssid: "BloodPoint",
     password: "12345678",
     uplink: null,
-    band: "5",
     channel: 149,
     country_code: "IN",
   });
@@ -2407,14 +1957,12 @@ $("btn-save").addEventListener("click", async () => {
   let profile;
   if (mode === "wap") {
     const up = $("edit-uplink").value;
-    const band = $("edit-band").value === "2.4" ? "2.4" : "5";
     profile = {
       mode: "wap",
       ssid: $("edit-ssid").value,
       password: $("edit-password").value,
       uplink: up || null,
-      band,
-      channel: parseInt($("edit-channel").value, 10) || (band === "2.4" ? 6 : 149),
+      channel: parseInt($("edit-channel").value, 10) || 149,
       country_code: $("edit-country").value || "IN",
     };
   } else {
@@ -2481,16 +2029,6 @@ watchGlanceTheme();
 reload().then(() => {
   const idx = state.interfaces[selectedIface]?.profile;
   if (idx != null) showEditor(idx);
-  // After WAP scan reconnect, restore last results if any
-  try {
-    const cached = JSON.parse(sessionStorage.getItem(SCAN_CACHE_KEY) || "null");
-    if (cached && cached.networks && cached.networks.length) {
-      openScanModal();
-      renderScanResults(cached);
-      $("scan-hint").textContent =
-        ( $("scan-hint").textContent || "" ) + " (restored after reconnect)";
-    }
-  } catch (_) {}
 }).catch(e => setStatus("Error: " + e.message));
 """
 

@@ -17,6 +17,14 @@ let inherit (lib) mkOption types mapAttrsToList flatten mapAttrs' nameValuePair;
       default = "lan";
       description = "Local DNS domain for reverse-proxied services (e.g. photos.lan).";
     };
+    media_location = mkOption {
+      type = types.str;
+      description = "Location of the media files for the services.";
+    };
+    appdata_location = mkOption {
+      type = types.str;
+      description = "Location of the appdata for the services.";
+    };
 
     # home_service.<name>.port = <port>;
     home_services = mkOption {
@@ -36,10 +44,12 @@ let inherit (lib) mkOption types mapAttrsToList flatten mapAttrs' nameValuePair;
     forService = name: import ./${name}.nix {
       inherit lib pkgs;
       inherit (config.home_services.${name}) port;
-      inherit (config) machine_name host_addr host_domain;
+      inherit (config) machine_name host_addr host_domain media_location appdata_location;
     };
   in lib.mkMerge [
     {
+      appdata_location = lib.mkDefault "${config.media_location}/.Apps";
+
       # Define a this user account. Don't forget to set a password with ‘passwd’.
       services.getty.autologinUser = config.machine_name;
       users.users.${config.machine_name} = {
@@ -108,12 +118,12 @@ let inherit (lib) mkOption types mapAttrsToList flatten mapAttrs' nameValuePair;
             '';
           };
         } // mapAttrs' (name: service:
-          nameValuePair "http://${name}.${config.host_domain}, http://${name}" {
+          nameValuePair "https://${name}.${config.host_domain}, https://${name}" {
             extraConfig = ''
+              tls internal
               reverse_proxy localhost:${toString service.port}
             '';
-          }
-        ) (builtins.removeAttrs config.home_services [ "dashboard" ]);
+          }) (builtins.removeAttrs config.home_services [ "dashboard" ]);
       };
 
       networking.firewall = {
@@ -125,6 +135,12 @@ let inherit (lib) mkOption types mapAttrsToList flatten mapAttrs' nameValuePair;
 
     # SERVICES
     (forService "dashboard")
+    (forService "media")
+    (forService "password")
+    (forService "photos")
+    (forService "torrent")
+    (forService "files")
+    (forService "git")
   ] # ++ (map forService (builtins.attrNames config.home_services)) # infinite recursion due to config.home_services
   ;
 }

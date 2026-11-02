@@ -13,7 +13,17 @@
   host_domain = "lan";
   home_services = {
     dashboard.port = 5678;
+    media.port = 8096;
+    password.port = 8222;
+    photos.port = 2283;
+    torrent.port = 8097;
+    files.port = 8085;
+    git.port = 3000;
   };
+  media_location = "/drives/Blood-Box";
+
+  fileSystems."/drives/Blood-Box" = {device = "/dev/sda"; fsType = "ext4"; options = ["nofail" "users"];};
+
 
   # Bootloader
   boot.loader = {
